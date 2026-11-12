@@ -685,3 +685,111 @@ async def test_forward_as_draft_keeps_attachments_and_does_not_send():
     _, attachments = get_body_and_attachments(drafted)
     assert [a.get_filename() for a in attachments] == ["report.pdf"]
     assert attachments[0].get_payload(decode=True) == b"%PDF-1.4"
+
+
+def _threaded_message(**kwargs):
+    """An original that carries Gmail's threadId, Message-ID, References and Cc."""
+    message = create_mock_message(**kwargs)
+    message["threadId"] = "thread-orig"
+    message["payload"]["headers"] += [
+        {"name": "Cc", "value": "Carol <carol@example.com>"},
+        {"name": "Message-ID", "value": "<orig@mail.example.com>"},
+        {"name": "References", "value": "<root@mail.example.com>"},
+    ]
+    return message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_attachment", [False, True])
+async def test_forward_joins_original_thread(with_attachment):
+    """Like Gmail's Forward: same conversation, threading headers, no 'Re:'."""
+    attachments = (
+        [{"filename": "a.pdf", "mimeType": "application/pdf", "attachmentId": "att1"}]
+        if with_attachment
+        else None
+    )
+    message = _threaded_message(
+        subject="Budget", text_body="Body.", attachments=attachments
+    )
+    mock_service = create_mock_service(
+        message,
+        attachments_data=[{"data": base64.urlsafe_b64encode(b"x").decode()}]
+        if with_attachment
+        else None,
+    )
+
+    await _forward_gmail_message_impl(
+        service=mock_service,
+        message_id="msg1",
+        to="landon@example.com",
+        user_google_email="me@example.com",
+    )
+
+    send_body = mock_service.users().messages().send.call_args.kwargs["body"]
+    assert send_body["threadId"] == "thread-orig"
+    sent = get_sent_mime_message(mock_service)
+    assert sent["Subject"] == "Fwd: Budget"
+    assert sent["In-Reply-To"] == "<orig@mail.example.com>"
+    assert sent["References"].split() == [
+        "<root@mail.example.com>",
+        "<orig@mail.example.com>",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_forward_draft_joins_original_thread():
+    message = _threaded_message(subject="Budget", text_body="Body.")
+    mock_service = create_mock_service(message)
+    mock_service.users().drafts().create().execute.return_value = {"id": "d1"}
+
+    await _forward_gmail_message_impl(
+        service=mock_service,
+        message_id="msg1",
+        to="landon@example.com",
+        user_google_email="me@example.com",
+        as_draft=True,
+    )
+
+    draft_body = mock_service.users().drafts().create.call_args.kwargs["body"]
+    assert draft_body["message"]["threadId"] == "thread-orig"
+
+
+@pytest.mark.asyncio
+async def test_forward_header_lists_original_cc():
+    message = _threaded_message(subject="Budget", text_body="Body.")
+    mock_service = create_mock_service(message)
+
+    await _forward_gmail_message_impl(
+        service=mock_service,
+        message_id="msg1",
+        to="landon@example.com",
+        user_google_email="me@example.com",
+    )
+
+    sent = get_sent_mime_message(mock_service)
+    assert "Cc: Carol <carol@example.com>" in get_body_text(sent, "plain")
+    assert "carol@example.com" in get_body_text(sent, "html")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("note", ["Can you approve?", None])
+async def test_forward_signature_sits_above_forwarded_block(note):
+    message = create_mock_message(subject="Budget", text_body="Original body.")
+    mock_service = create_mock_service(message)
+
+    await _forward_gmail_message_impl(
+        service=mock_service,
+        message_id="msg1",
+        to="landon@example.com",
+        user_google_email="me@example.com",
+        forward_message=note,
+        signature_html="<b>Dashly Finance</b>",
+    )
+
+    sent = get_sent_mime_message(mock_service)
+    html = get_body_text(sent, "html")
+    assert html.index("<b>Dashly Finance</b>") < html.index("Forwarded message")
+    plain = get_body_text(sent, "plain")
+    assert plain.index("Dashly Finance") < plain.index("Forwarded message")
+    if note:
+        assert plain.index(note) < plain.index("Dashly Finance")

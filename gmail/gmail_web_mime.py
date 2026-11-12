@@ -275,14 +275,21 @@ def _render_recipients_html(raw_header: str) -> str:
 
 
 def build_forwarded_container_html(
-    from_name: str, from_email: str, date: str, subject: str, to: str, orig_html: str
+    from_name: str,
+    from_email: str,
+    date: str,
+    subject: str,
+    to: str,
+    orig_html: str,
+    cc: str = "",
 ) -> str:
     """Assemble Gmail's ``gmail_quote_container`` for a forwarded message.
 
     The ``gmail_attr`` header block (separator, From, Date, Subject, To) is
     followed directly by the original HTML; unlike a reply there is no
     blockquote. ``from_name`` or ``from_email`` may be empty; ``to`` is the raw
-    header value and ``orig_html`` is inserted verbatim.
+    header value and ``orig_html`` is inserted verbatim. A Cc line follows To
+    only when the original had one, as in Gmail web.
     """
     from_fields = []
     if from_name:
@@ -301,13 +308,20 @@ def build_forwarded_container_html(
         f"Date: {_escape_body(date)}<br>"
         f"Subject: {_escape_body(subject)}<br>"
         f"To: {_render_recipients_html(to)}<br>"
-        "</div>"
+        + (f"Cc: {_render_recipients_html(cc)}<br>" if cc else "")
+        + "</div>"
     )
     return f'<div class="gmail_quote gmail_quote_container">{attr_div}{orig_html}</div>'
 
 
 def build_forwarded_plain(
-    from_name: str, from_email: str, date: str, subject: str, to: str, orig_plain: str
+    from_name: str,
+    from_email: str,
+    date: str,
+    subject: str,
+    to: str,
+    orig_plain: str,
+    cc: str = "",
 ) -> str:
     """Assemble Gmail's plain-text forwarded block.
 
@@ -323,9 +337,7 @@ def build_forwarded_plain(
         f"From: {from_field}\n"
         f"Date: {date}\n"
         f"Subject: {subject}\n"
-        f"To: {to}\n"
-        "\n"
-        f"{orig_plain}"
+        f"To: {to}\n" + (f"Cc: {cc}\n" if cc else "") + "\n" + f"{orig_plain}"
     )
 
 

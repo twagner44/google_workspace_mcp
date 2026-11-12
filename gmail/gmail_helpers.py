@@ -1113,11 +1113,13 @@ def _build_forward_content(
     forward_message_format: Literal["plain", "html"],
     subject_override: Optional[str],
     direction: TextDirection = "auto",
+    signature_html: str = "",
 ) -> tuple[str, str, str]:
     """Build the (subject, text/plain, text/html) of a Gmail-web forward.
 
     An explicit ``subject_override`` wins over the derived 'Fwd: <subject>'.
-    The optional note leads the body and sets its base direction.
+    The optional note leads the body and sets its base direction. As in Gmail
+    web, ``signature_html`` sits after the note and above the forwarded block.
     """
     orig_subject = headers.get("Subject", "(no subject)")
     orig_from = headers.get("From", "(unknown sender)")
@@ -1141,6 +1143,7 @@ def _build_forward_content(
         "date": format_gmail_date(orig_dt) if orig_dt else orig_date,
         "subject": orig_subject,
         "to": headers.get("To", ""),
+        "cc": headers.get("Cc", ""),
     }
     orig_plain, orig_html = _fill_missing_body(
         bodies.get("text", ""), bodies.get("html", "")
@@ -1148,12 +1151,15 @@ def _build_forward_content(
     forward_plain = build_forwarded_plain(**header, orig_plain=orig_plain)
     container = build_forwarded_container_html(**header, orig_html=orig_html)
 
-    if not forward_message:
+    has_signature = bool(signature_html and signature_html.strip())
+    if not forward_message and not has_signature:
         # Nothing user-authored to orient, so "auto" stays ltr.
         resolved = "ltr" if direction == "auto" else direction
         return subject, forward_plain, new_message_html(f"<br>{container}", resolved)
 
-    if forward_message_format == "html":
+    if not forward_message:
+        note_plain = note_html = ""
+    elif forward_message_format == "html":
         note_html = html_newlines_to_br(forward_message)
         note_plain = html_to_text_preserving_breaks(note_html).strip()
         if direction != "auto":
@@ -1161,6 +1167,15 @@ def _build_forward_content(
             note_html = _force_leading_dir(note_html, direction)
     else:
         note_plain, note_html = forward_message, plain_body_to_html(forward_message)
+
+    if has_signature:
+        separator = "<br><br>" if note_html.strip() else "<br>"
+        note_html = f"{note_html}{separator}{_wrap_signature_html(signature_html)}"
+        signature_text = _signature_html_to_text(signature_html).strip()
+        if signature_text:
+            note_plain = (
+                f"{note_plain}\n\n{signature_text}" if note_plain else signature_text
+            )
 
     if note_plain:
         forward_plain = f"{note_plain}\n\n{forward_plain}"
@@ -1209,15 +1224,20 @@ def _prepare_gmail_message_web(
     references: Optional[str] = None,
     from_email: Optional[str] = None,
     from_name: Optional[str] = None,
+    reply_prefix: bool = True,
 ) -> str:
     """Assemble a Gmail-web faithful ``multipart/alternative`` raw message.
 
     ``plain_body`` and ``html_body`` are the finished text/plain and text/html
     parts. Headers are authored in Gmail's order; To/Cc/Bcc are validated and
     their non-ASCII display names RFC 2047 encoded. Message-ID is left for
-    Gmail to assign. Returns the base64url raw message.
+    Gmail to assign. Returns the base64url raw message. ``reply_prefix=False``
+    keeps the subject as given when In-Reply-To is set, as a threaded forward
+    ('Fwd: ...') needs.
     """
-    subject = _reply_subject(_checked_header("Subject", subject), in_reply_to)
+    subject = _checked_header("Subject", subject)
+    if reply_prefix:
+        subject = _reply_subject(subject, in_reply_to)
     if not subject.isascii():
         # Encode after the check: a long encoded subject folds with a legal CRLF.
         subject = Header(subject, "utf-8", header_name="Subject").encode(

@@ -1326,6 +1326,7 @@ def _prepare_gmail_message(
     from_name: Optional[str] = None,
     attachments: Optional[List[Dict[str, str]]] = None,
     plain_body: Optional[str] = None,
+    reply_prefix: bool = True,
 ) -> tuple[str, Optional[str], int, List[str]]:
     """
     Prepare a Gmail message with threading and attachment support.
@@ -1344,6 +1345,7 @@ def _prepare_gmail_message(
         from_name: Optional sender display name (e.g., "Peter Hartree")
         attachments: Optional list of attachments. Each can have 'path' (file path) OR 'content' (base64) + 'filename'
         plain_body: Explicit text alternative for HTML, preserving a forwarded original.
+        reply_prefix: Add 'Re:' when in_reply_to is set. A threaded forward passes False.
 
     Returns:
         Tuple of (raw_message, thread_id, attached_count, attachment_errors)
@@ -1358,7 +1360,9 @@ def _prepare_gmail_message(
     attachment_errors: List[str] = []
     message = EmailMessage(policy=SMTP)
 
-    message["Subject"] = _reply_subject(subject, in_reply_to)
+    message["Subject"] = (
+        _reply_subject(subject, in_reply_to) if reply_prefix else subject
+    )
 
     # Add sender if provided
     if from_email:
@@ -2673,7 +2677,9 @@ async def send_gmail_message(
     To forward an existing message, pass forward_message_id. The original subject,
     body (quoted with a "Forwarded message" header), and attachments are carried over.
     In forward mode, body (if any) is prepended as a note and subject is optional.
-    Threading, reply, and signature options do not apply when forwarding.
+    A forward joins the original's conversation, as Gmail's Forward does, and
+    include_signature places the signature above the forwarded message. Reply
+    options (thread_id, in_reply_to, reply_all, quote_original) do not apply.
 
     THIS TOOL SENDS IMMEDIATELY AND CANNOT SCHEDULE. Gmail's REST API exposes no
     send-time parameter; Schedule send is a web-UI feature with no API equivalent,
@@ -2836,14 +2842,21 @@ async def send_gmail_message(
         # An explicit alias is always validated. Otherwise the Send-As
         # displayName is only looked up when signatures are enabled, so the
         # settings endpoint stays optional, as on a regular send.
-        if from_email or (include_signature and not from_name):
-            _, sender_display_name, _ = await _get_send_as_identity_and_signature(
+        forward_signature_html = ""
+        if from_email or include_signature:
+            (
+                _,
+                sender_display_name,
+                resolved_signature_html,
+            ) = await _get_send_as_identity_and_signature(
                 service,
                 from_email=from_email or user_google_email,
                 fallback_email=user_google_email,
                 require_match=bool(from_email),
             )
             from_name = from_name or sender_display_name or None
+            if include_signature:
+                forward_signature_html = resolved_signature_html
         return await _forward_gmail_message_impl(
             service=service,
             message_id=forward_message_id,
@@ -2859,6 +2872,7 @@ async def send_gmail_message(
             from_email=from_email,
             user_google_email=user_google_email,
             direction=direction,
+            signature_html=forward_signature_html,
         )
 
     if body is None or (not thread_id and not (subject or "").strip()):
@@ -3042,6 +3056,7 @@ async def _forward_gmail_message_impl(
     direction: TextDirection = "auto",
     as_draft: bool = False,
     attachments: Optional[List[Dict[str, Any]]] = None,
+    signature_html: str = "",
 ) -> str:
     """Build a forward of an existing Gmail message and send it or save it as a draft.
 
@@ -3049,6 +3064,10 @@ async def _forward_gmail_message_impl(
     explicit ``subject`` overrides the auto-derived 'Fwd: <original subject>'.
     ``direction`` sets the base text direction of the prepended note ('auto'
     detects it from the note text).
+
+    Like Gmail web's Forward, the forward joins the original's conversation
+    (threadId) and carries In-Reply-To and References pointing at the original,
+    so it reads as a forward rather than a new email that quotes one.
     """
     # Fetch the original message with full payload
     original_message = await asyncio.to_thread(
@@ -3132,14 +3151,23 @@ async def _forward_gmail_message_impl(
 
     attachments_to_send.extend(await _resolve_url_attachments(attachments) or [])
 
+    orig_headers = _extract_headers(
+        payload, ["Subject", "From", "Date", "To", "Cc", "Message-ID", "References"]
+    )
     forward_subject, forward_plain, forward_html = _build_forward_content(
-        _extract_headers(payload, ["Subject", "From", "Date", "To"]),
+        orig_headers,
         _extract_message_bodies(payload),
         forward_message,
         forward_message_format,
         subject,
         direction,
+        signature_html,
     )
+    in_reply_to = orig_headers.get("Message-ID") or None
+    references = (
+        " ".join(filter(None, [orig_headers.get("References"), in_reply_to])) or None
+    )
+    thread_id = original_message.get("threadId")
 
     # --- Prepare and send the message ---
     sender_email = from_email or user_google_email
@@ -3157,6 +3185,9 @@ async def _forward_gmail_message_impl(
             from_email=sender_email,
             from_name=from_name,
             attachments=attachments_to_send,
+            in_reply_to=in_reply_to,
+            references=references,
+            reply_prefix=False,
         )
     else:
         raw_message = _prepare_gmail_message_web(
@@ -3166,8 +3197,11 @@ async def _forward_gmail_message_impl(
             to=to,
             cc=cc,
             bcc=bcc,
+            in_reply_to=in_reply_to,
+            references=references,
             from_email=sender_email,
             from_name=from_name,
+            reply_prefix=False,
         )
         attached_count, attachment_errors = 0, []
     if attachments_to_send and attached_count != len(attachments_to_send):
@@ -3185,6 +3219,8 @@ async def _forward_gmail_message_impl(
         else ""
     )
     send_body = {"raw": raw_message}
+    if thread_id:
+        send_body["threadId"] = thread_id
 
     if as_draft:
         created_draft = await asyncio.to_thread(
@@ -3324,8 +3360,10 @@ async def draft_gmail_message(
 
     To save a forward as a draft for review, pass forward_message_id. The original
     subject, body (quoted with a "Forwarded message" header), and attachments are
-    carried over. In forward mode, body (if any) is prepended as a note, subject is
-    optional, and threading, reply, and signature options do not apply.
+    carried over. In forward mode, body (if any) is prepended as a note and subject
+    is optional. The forward joins the original's conversation, as Gmail's Forward
+    does, and include_signature places the signature above the forwarded message.
+    Reply options (thread_id, in_reply_to, reply_all, quote_original) do not apply.
 
     SCHEDULED SEND IS NOT AVAILABLE. Gmail's REST API exposes no send-time
     parameter; the Schedule send feature is web-UI only, and a message cannot be
@@ -3451,7 +3489,7 @@ async def draft_gmail_message(
         (
             sender_email,
             sender_display_name,
-            _,
+            resolved_signature_html,
         ) = await _get_send_as_identity_and_signature(
             service, from_email=from_email, fallback_email=user_google_email
         )
@@ -3475,6 +3513,7 @@ async def draft_gmail_message(
             user_google_email=user_google_email,
             direction=direction,
             as_draft=True,
+            signature_html=resolved_signature_html if include_signature else "",
         )
 
     if body is None or (not thread_id and not (subject or "").strip()):
